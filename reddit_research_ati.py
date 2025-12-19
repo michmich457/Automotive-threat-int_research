@@ -1,93 +1,108 @@
-import os
-import time
+import argparse
+import csv
 import logging
-from dataclasses import dataclass
-from typing import Iterable, Dict, Any, List, Optional
+import math
+from datetime import datetime, timezone
+from collections import Counter, defaultdict
+from typing import List, Dict, Any
 
-import praw
+from dotenv import load_dotenv
 
-log = logging.getLogger(__name__)
+from reddit_client import load_config_from_env, make_reddit_client, fetch_posts
 
-
-@dataclass(frozen=True)
-class RedditConfig:
-    client_id: str
-    client_secret: str
-    user_agent: str
-    sleep_seconds: float = 1.0  # gentle pacing; keep it conservative
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("analysis")
 
 
-def load_config_from_env() -> RedditConfig:
-    client_id = os.getenv("REDDIT_CLIENT_ID", "").strip()
-    client_secret = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
-    user_agent = os.getenv("REDDIT_USER_AGENT", "academic-automotive-cyber-research").strip()
+DEFAULT_KEYWORDS = [
+    "can", "can bus", "canfd", "uds", "xcp", "ecu", "bootloader",
+    "ota", "telematics", "gateway", "immobilizer", "keyless",
+    "reverse engineering", "firmware", "diagnostics", "autosar",
+    "secoc", "vulnerability", "exploit", "malware"
+]
 
-    if not client_id or not client_secret:
-        raise RuntimeError(
-            "Missing Reddit credentials. Set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET."
-        )
 
-    return RedditConfig(
-        client_id=client_id,
-        client_secret=client_secret,
-        user_agent=user_agent,
+def to_week_bucket(created_utc: float) -> str:
+    dt = datetime.fromtimestamp(created_utc, tz=timezone.utc)
+    year, week, _ = dt.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def normalize(text: str) -> str:
+    return " ".join((text or "").lower().split())
+
+
+def keyword_hits(title: str, keywords: List[str]) -> Counter:
+    t = normalize(title)
+    c = Counter()
+    for kw in keywords:
+        k = normalize(kw)
+        if k and k in t:
+            c[k] += 1
+    return c
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Read-only Reddit topic trend analysis (automotive cybersecurity).")
+    parser.add_argument("--subreddits", default="cybersecurity,netsec,CarHacking,ReverseEngineering,embedded,IOTSecurity,automotive")
+    parser.add_argument("--limit", type=int, default=300, help="Posts per subreddit")
+    parser.add_argument("--listing", choices=["new", "hot", "top"], default="new")
+    parser.add_argument("--out", default="out.csv")
+    parser.add_argument("--keywords", default=",".join(DEFAULT_KEYWORDS))
+    args = parser.parse_args()
+
+    load_dotenv()
+
+    cfg = load_config_from_env()
+    reddit = make_reddit_client(cfg)
+
+    subreddits = [s.strip() for s in args.subreddits.split(",") if s.strip()]
+    keywords = [k.strip() for k in args.keywords.split(",") if k.strip()]
+
+    posts = fetch_posts(
+        reddit,
+        subreddits=subreddits,
+        limit_per_subreddit=args.limit,
+        listing=args.listing,
+        sleep_seconds=cfg.sleep_seconds,
     )
 
+    # Aggregate counts by ISO week bucket
+    bucket_counts = defaultdict(Counter)  # bucket -> Counter(keyword -> count)
+    bucket_total_posts = Counter()        # bucket -> total posts
 
-def make_reddit_client(cfg: RedditConfig) -> praw.Reddit:
-    # Read-only client (no username/password, no refresh token)
-    reddit = praw.Reddit(
-        client_id=cfg.client_id,
-        client_secret=cfg.client_secret,
-        user_agent=cfg.user_agent,
-        check_for_async=False,
-    )
-    # Optional: explicitly keep it read-only
-    reddit.read_only = True
-    return reddit
+    for p in posts:
+        bucket = to_week_bucket(p["created_utc"])
+        bucket_total_posts[bucket] += 1
+        bucket_counts[bucket] += keyword_hits(p["title"], keywords)
+
+    # Write a flat CSV: one row per (bucket, keyword)
+    rows = []
+    for bucket in sorted(bucket_counts.keys()):
+        total = bucket_total_posts[bucket]
+        for kw in keywords:
+            k = normalize(kw)
+            hits = bucket_counts[bucket][k]
+            # simple normalized rate: hits per 100 posts
+            rate = (hits / total * 100.0) if total else 0.0
+            rows.append({
+                "week": bucket,
+                "subreddits": ";".join(subreddits),
+                "keyword": k,
+                "hits": hits,
+                "total_posts": total,
+                "hits_per_100_posts": round(rate, 4),
+            })
+
+    with open(args.out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else [
+            "week", "subreddits", "keyword", "hits", "total_posts", "hits_per_100_posts"
+        ])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    log.info("Done. Wrote %d rows to %s", len(rows), args.out)
 
 
-def fetch_posts(
-    reddit: praw.Reddit,
-    subreddits: Iterable[str],
-    limit_per_subreddit: int = 500,
-    listing: str = "new",
-    sleep_seconds: float = 1.0,
-) -> List[Dict[str, Any]]:
-    """
-    Fetch public post metadata (read-only).
-    Stores only: title, created_utc, subreddit, id, permalink.
-    """
-    results: List[Dict[str, Any]] = []
-
-    for sub in subreddits:
-        sub = sub.strip()
-        if not sub:
-            continue
-
-        log.info("Fetching r/%s (%s, limit=%d)", sub, listing, limit_per_subreddit)
-        sr = reddit.subreddit(sub)
-
-        if listing == "hot":
-            iterator = sr.hot(limit=limit_per_subreddit)
-        elif listing == "top":
-            iterator = sr.top(limit=limit_per_subreddit)
-        else:
-            iterator = sr.new(limit=limit_per_subreddit)
-
-        for post in iterator:
-            # Minimal, non-personal metadata
-            results.append(
-                {
-                    "id": post.id,
-                    "subreddit": post.subreddit.display_name,
-                    "created_utc": float(post.created_utc),
-                    "title": post.title or "",
-                    "permalink": f"https://www.reddit.com{post.permalink}",
-                }
-            )
-
-        # Gentle pacing between subreddits
-        time.sleep(max(0.0, float(sleep_seconds)))
-
-    return results
+if __name__ == "__main__":
+    main()
